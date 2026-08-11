@@ -1,0 +1,30 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python environments and cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Logs and runtime files
+*.log
+*.pid
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Local database
+backend/delivery.db
+
+# IDE and editor settings
+.idea/
+.vscode/
+
+# Personal notes
+learning.md
+notes.md
+project_notes.md
