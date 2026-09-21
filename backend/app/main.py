@@ -1,29 +1,40 @@
 from __future__ import annotations
-
-import hashlib
-import hmac
-import secrets
+from argon2 import PasswordHasher
+import jwt
+from jwt.exceptions import InvalidTokenError
+from fastapi.security import OAuth2PasswordBearer
+from datetime import datetime, timedelta, timezone
+import logging
 import sqlite3
-from db import get_db, row_to_dict
+from app.db import get_db, row_to_dict, init_db
 import urllib.error #should delete?
 import urllib.request  #should delete?
 from typing import Annotated
 import os, json
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from dotenv import load_dotenv
 from openai import OpenAI
-
+from pathlib import Path
 
 app = FastAPI(title="Delivery App API") #start a backend server
 
-load_dotenv()
+p = Path(__file__).parent.resolve()
+abs = p / '.env'
+load_dotenv(abs)
 
 client = OpenAI(
-    api_key=os.getenv("GEMINI_API_KEY"),
+    api_key=os.getenv("GEMINI_API_KEY"), #may change to pathlib?
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
+
+secret_key = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,157 +44,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def hash_password(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000)
-    return f"{salt}${digest.hex()}"
+ph = PasswordHasher()
 
+def hash_password(password: str) -> str:
+    digest = ph.hash(password)
+    return digest
 
-def verify_password(password: str, stored: str) -> bool:
-    salt, expected = stored.split("$", 1)
-    candidate = hash_password(password, salt).split("$", 1)[1]
-    return hmac.compare_digest(candidate, expected)
+def verify_password(stored: str, password: str) -> bool:
+    try:
+        return ph.verify(stored, password)
+    except:
+        return False
 
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
+    return encoded
 
-def init_db():
+def get_current_user_id(token: Annotated[str, Depends(oauth2_scheme)]):
+    try:
+        payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise InvalidCredentialsError
+        user_id = int(user_id)
+        if user_id <= 0:
+            raise InvalidCredentialsError
+    except jwt.ExpiredSignatureError:
+        raise TokenExpiredError
+    except (InvalidTokenError, ValueError, TypeError):
+        raise InvalidCredentialsError
+    return user_id
+
+def get_current_user(user_id: Annotated[int, Depends(get_current_user_id)]):
     with get_db() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                token TEXT UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS stores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                cuisine TEXT NOT NULL,
-                rating REAL NOT NULL,
-                delivery_minutes INTEGER NOT NULL,
-                delivery_fee REAL NOT NULL,
-                minimum_order REAL NOT NULL,
-                hero_image TEXT NOT NULL,
-                description TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS foods (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                store_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                price REAL NOT NULL,
-                image TEXT NOT NULL,
-                category TEXT NOT NULL,
-                popular INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (store_id) REFERENCES stores(id) --there's 2 store_id?
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                total REAL NOT NULL,
-                status TEXT NOT NULL,
-                payment_status TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS order_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL,
-                food_id INTEGER NOT NULL,
-                quantity INTEGER NOT NULL,
-                price REAL NOT NULL,
-                FOREIGN KEY (order_id) REFERENCES orders(id),
-                FOREIGN KEY (food_id) REFERENCES foods(id)
-            );
-            """
-        )
-
-        existing = db.execute("SELECT COUNT(*) AS count FROM stores").fetchone()["count"]
-        if existing:
-            return
-
-        stores = [
-            (
-                "Luna Verde",
-                "Modern Italian",
-                4.8,
-                24,
-                1.99,
-                12,
-                "https://images.unsplash.com/photo-1514933651103-005eec06c04b?auto=format&fit=crop&w=1200&q=80",
-                "Handmade pasta, crisp salads, and slow-cooked sauces from a bright neighborhood kitchen.",
-            ),
-            (
-                "Tokyo Bowl House",
-                "Japanese",
-                4.7,
-                18,
-                0.99,
-                10,
-                "https://images.unsplash.com/photo-1617196034796-73dfa7b1fd56?auto=format&fit=crop&w=1200&q=80",
-                "Fresh rice bowls, yakitori, and clean flavors built for fast comfort.",
-            ),
-            (
-                "The Daily Grill",
-                "Burgers",
-                4.6,
-                21,
-                1.49,
-                9,
-                "https://images.unsplash.com/photo-1550547660-d9450f859349?auto=format&fit=crop&w=1200&q=80",
-                "Charred burgers, loaded fries, and proper sauces made after each order.",
-            ),
-        ]
-        db.executemany(
-            """
-            INSERT INTO stores
-                (name, cuisine, rating, delivery_minutes, delivery_fee, minimum_order, hero_image, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            stores,
-        )
-
-        foods = [
-            (1, "Truffle Tagliatelle", "Egg pasta, wild mushrooms, parmesan, black truffle oil.", 15.5, "https://images.unsplash.com/photo-1621996346565-e3dbc646d9a9?auto=format&fit=crop&w=900&q=80", "Pasta", 1),
-            (1, "Burrata Pomodoro", "Creamy burrata with cherry tomatoes, basil, olive oil.", 10.25, "https://images.unsplash.com/photo-1505253716362-afaea1d3d1af?auto=format&fit=crop&w=900&q=80", "Starters", 1),
-            (1, "Tiramisu Cup", "Mascarpone cream, espresso-soaked sponge, cocoa.", 6.5, "https://images.unsplash.com/photo-1571877227200-a0d98ea607e9?auto=format&fit=crop&w=900&q=80", "Dessert", 0),
-            (2, "Salmon Teriyaki Bowl", "Grilled salmon, steamed rice, pickled cucumber, sesame.", 13.75, "https://images.unsplash.com/photo-1512058564366-18510be2db19?auto=format&fit=crop&w=900&q=80", "Bowls", 1),
-            (2, "Chicken Katsu Curry", "Crispy chicken, curry sauce, rice, red ginger.", 12.95, "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?auto=format&fit=crop&w=900&q=80", "Hot Plates", 1),
-            (2, "Miso Aubergine", "Roasted aubergine with sweet miso glaze and scallions.", 8.5, "https://images.unsplash.com/photo-1498654896293-37aacf113fd9?auto=format&fit=crop&w=900&q=80", "Small Plates", 0),
-            (3, "House Smash Burger", "Double beef patty, cheddar, pickles, house sauce.", 11.95, "https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=900&q=80", "Burgers", 1),
-            (3, "Crispy Halloumi Burger", "Halloumi, slaw, chilli jam, garlic mayo.", 10.95, "https://images.unsplash.com/photo-1550317138-10000687a72b?auto=format&fit=crop&w=900&q=80", "Burgers", 0),
-            (3, "Rosemary Fries", "Skin-on fries with rosemary salt and aioli.", 4.75, "https://images.unsplash.com/photo-1576107232684-1279f390859f?auto=format&fit=crop&w=900&q=80", "Sides", 1),
-        ]
-        db.executemany(
-            """
-            INSERT INTO foods
-                (store_id, name, description, price, image, category, popular)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            foods,
-        )
-
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None:
+        raise InvalidCredentialsError  #假如A,B用户均有token，是否可能B用了A的token进入A的用户权限？
+    return UserPublic(id=user["id"], name=user["name"], email=user["email"])
 
 @app.on_event("startup")
 def startup():
     init_db()
 
-
 class RegisterPayload(BaseModel):
     name: str = Field(min_length=2, max_length=80)
-    email: str = Field(min_length=5, max_length=120)
-    password: str = Field(min_length=6, max_length=128)
-
+    email: EmailStr = Field(min_length=5, max_length=120)
+    password: str = Field(min_length=8, max_length=16)
+    @field_validator("password")
+    @classmethod
+    def password_must_have_special_char(cls, value):
+        special_characters = "!@#$%^&*()-_=+[]{}|;:,.<>?/"
+        if not any(char in special_characters for char in value):
+            raise ValueError("Password must contain at least one special character")
+        return value
 
 class LoginPayload(BaseModel):
-    email: str = Field(min_length=5, max_length=120)
+    email: EmailStr = Field(min_length=5, max_length=120)
     password: str
 
+class UserPublic(BaseModel):
+    id: int
+    name: str
+    email: str
 
 class OrderItemPayload(BaseModel):
     food_id: int
@@ -213,54 +141,124 @@ class StoreRecommendation(BaseModel):
 class StoresList(BaseModel):
     stores_recommend: list[StoreRecommendation]
 
-def issue_user_response(user: sqlite3.Row):
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+def issue_user_response(user: UserPublic, token: Token):
     return {
-        "user": {"id": user["id"], "name": user["name"], "email": user["email"]},
-        "token": user["token"],
+        "user": {"id": user.id, "name": user.name, "email": user.email},
+        "token": token.access_token,
     }
 
+# need to delete
+# def current_user(authorization: Annotated[str | None, Header()] = None):
+#    if not authorization or not authorization.startswith("Bearer "):
+#    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing auth token")
+#     token = authorization.removeprefix("Bearer ").strip()
+  #  with get_db() as db:
+ #       user = db.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
+#    if not user:
+#        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth token")
 
-def current_user(authorization: Annotated[str | None, Header()] = None):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing auth token")
-    token = authorization.removeprefix("Bearer ").strip()
-    with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth token")
-    return user
+#    return user
+class AppError(Exception):
+    status_code = 500
+    code = "APP_ERROR"
+    message = "Something went wrong, please try again later."
 
+class UserAlreadyExistsError(AppError):
+    status_code = 409
+    code = "USER_EXISTS"
+    message = "Email is already registered. Please log in instead."
+
+class InvalidCredentialsError(AppError):
+    status_code = 401
+    code = "INVALID_CREDENTIALS"
+    message = "Could not validate credentials."
+
+class TokenExpiredError(AppError):
+    status_code = 401
+    code = "TOKEN_EXPIRED"
+    message = "Your session has expired. Please log in again."
+
+class InvalidLoginError(AppError):
+    status_code = 401
+    code = "INVALID_LOGIN"
+    message = "Invalid email or password."
+
+class ExternalServiceError(AppError):
+    status_code = 503
+    code = "EXTERNAL_SERVICE_ERROR"
+    message = "This service is temporarily unavailable. Please try again later."
+
+class StoreNotFoundError(AppError):
+    status_code = 404
+    code = "STORE_NOT_FOUND"
+    message = "This store is unavailable. Please refresh and try again."
+
+class FoodUnavailableError(AppError):
+    status_code = 404
+    code = "FOOD_UNAVAILABLE"
+    message = "One or more items in your order are no longer available. Please refresh and try again."
+
+@app.exception_handler(AppError)
+def handle_app_error(_, exc: AppError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error":{"code": exc.code,"message":exc.message}}
+    )
+
+logger = logging.getLogger(__name__)
+@app.exception_handler(Exception)
+def exception_handler(_, exc: Exception):
+    logger.error("Unhandled exception occurred",exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"error":{"code":"INTERNAL_ERROR","message":"Something went wrong, please try again later."}}
+    )
+
+@app.exception_handler(RequestValidationError)
+def validation_handler(_, exc: RequestValidationError):
+    errors = exc.errors()
+    error = [error["loc"][-1] for error in errors]
+    print(errors)
+    message = errors[0]["msg"] if errors and len(errors) < 2 else "Please check your input."
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "VALIDATION_ERROR", "message": message, "details": error}}
+    )
 
 @app.post("/api/auth/register")
 def register(payload: RegisterPayload):
-    if "@" not in payload.email:
-        raise HTTPException(status_code=422, detail="Please enter a valid email")
-    token = secrets.token_urlsafe(32)
     try:
         with get_db() as db:
             db.execute(
-                "INSERT INTO users (name, email, password_hash, token) VALUES (?, ?, ?, ?)",
-                (payload.name, payload.email.lower(), hash_password(payload.password), token),
+                "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
+                (payload.name, payload.email.lower(), hash_password(payload.password)),
             )
             user = db.execute("SELECT * FROM users WHERE email = ?", (payload.email.lower(),)).fetchone()
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Email is already registered") from None
-    return issue_user_response(user)
+        raise UserAlreadyExistsError()
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token({"sub": str(user["id"])}, access_token_expires)
+    user_public = UserPublic(id=user["id"], name=user["name"], email=user["email"])
+    return issue_user_response(user_public, Token(access_token=token, token_type="bearer")) #return token_type how to handle?
 
+@app.get("/api/auth/users/me")
+def get_users_me(current_user: Annotated[UserPublic, Depends(get_current_user)]):
+    return current_user
 
-@app.post("/api/auth/login")   # it can use JWT no need to check database?
+@app.post("/api/auth/login")
 def login(payload: LoginPayload):
-    if "@" not in payload.email:
-        raise HTTPException(status_code=422, detail="Please enter a valid email")
     with get_db() as db:
         user = db.execute("SELECT * FROM users WHERE email = ?", (payload.email.lower(),)).fetchone()
-        if not user or not verify_password(payload.password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-        token = secrets.token_urlsafe(32)
-        db.execute("UPDATE users SET token = ? WHERE id = ?", (token, user["id"]))
-        user = db.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-    return issue_user_response(user)
-
+        if not user or not verify_password(user["password_hash"], payload.password):
+            raise InvalidLoginError
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token({"sub": str(user["id"])}, access_token_expires)
+    user_public = UserPublic(id=user["id"], name=user["name"], email=user["email"])
+    return issue_user_response(user_public, Token(access_token=token, token_type="bearer"))
 
 @app.get("/api/stores")
 def list_stores():
@@ -268,33 +266,32 @@ def list_stores():
         stores = db.execute("SELECT * FROM stores ORDER BY rating DESC").fetchall()
     return [row_to_dict(store) for store in stores]
 
-
 @app.get("/api/stores/{store_id}")
 def get_store(store_id: int):
     with get_db() as db:
         store = db.execute("SELECT * FROM stores WHERE id = ?", (store_id,)).fetchone()
         foods = db.execute("SELECT * FROM foods WHERE store_id = ? ORDER BY popular DESC, id", (store_id,)).fetchall()
     if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
+        raise StoreNotFoundError
     data = row_to_dict(store)
     data["foods"] = [row_to_dict(food) for food in foods]
     return data
 
-
 @app.post("/api/orders")
-def create_order(payload: OrderPayload, user: sqlite3.Row = Depends(current_user)):
+def create_order(payload: OrderPayload, user: UserPublic = Depends(get_current_user)):
     ids = [item.food_id for item in payload.items]
     placeholders = ",".join("?" for _ in ids)
     with get_db() as db:
         foods = db.execute(f"SELECT * FROM foods WHERE id IN ({placeholders})", ids).fetchall()
         food_by_id = {food["id"]: food for food in foods}
+        #user experience improvement
         if len(food_by_id) != len(set(ids)):
-            raise HTTPException(status_code=400, detail="One or more food items do not exist")
+            raise FoodUnavailableError
 
         total = sum(food_by_id[item.food_id]["price"] * item.quantity for item in payload.items)
         cursor = db.execute(
             "INSERT INTO orders (user_id, total, status, payment_status) VALUES (?, ?, ?, ?)",
-            (user["id"], round(total, 2), "created", "pending"),
+            (user.id, round(total, 2), "created", "pending"),
         )
         order_id = cursor.lastrowid
         db.executemany(
@@ -323,23 +320,23 @@ def search_recommendations(payload:SearchInput):
     for food in foods:
         store_lookup[food['store_id']]['foods'].append(food)
     data = list(store_lookup.values())
-
-    response = client.chat.completions.parse(
-        model="gemini-3.5-flash",
-        messages=[
-            {"role": "user",
-             "content": query + json.dumps(data) + "at most recommend 3 stores and at most 3 types of foods per store"
-             }
-        ],
-        response_format=StoresList,
-    )
-
-    result = response.choices[0].message.parsed
-    result.stores_recommend = result.stores_recommend[:3]
-    for r in result.stores_recommend:
-        r.foodlist = r.foodlist[:3]
-    return result.stores_recommend
-
+    try:
+        response = client.chat.completions.parse(
+            model="gemini-3.5-flash",
+            messages=[
+                {"role": "user",
+                "content": query + json.dumps(data) + "at most recommend 3 stores and at most 3 types of foods per store"
+                }
+            ],
+            response_format=StoresList,
+        )
+        result = response.choices[0].message.parsed
+        result.stores_recommend = result.stores_recommend[:3]
+        for r in result.stores_recommend:
+            r.foodlist = r.foodlist[:3]
+        return result.stores_recommend
+    except:
+        raise ExternalServiceError
 
 @app.get("/api/health")
 def health():
