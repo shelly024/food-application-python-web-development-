@@ -1,6 +1,7 @@
 # Environment variables and secrets
 .env
 .env.*
+backend/secret.key
 !.env.example
 
 # Python environments and cache
