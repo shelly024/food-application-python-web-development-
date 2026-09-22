@@ -13,34 +13,69 @@ function App() {
   const [authOpen, setAuthOpen] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
   const [checkout, setCheckout] = useState(null);
+  const [authStatus, setAuthStatus] = useState("checking");
   const [user, setUser] = useState(null);  //no need to save user in localstorage
   /*() => {
     const saved = localStorage.getItem("delivery_user");
     return saved ? JSON.parse(saved) : null;
   }*/
+  const [error, setError] = useState(null);
+  //why can't use async?
+  useEffect(() => {
+    api.stores().then(setStores).catch((err)=>(setError(err.message)));
+    /* ?console error */
+      //home stores block, network issues, no exception
+  }, []);
 
   useEffect(() => {
-    api.stores().then(setStores).catch(console.error);
-  }, []);
+    const token = localStorage.getItem("delivery_token");
+    if (token === null) {
+      setAuthStatus("unauthenticated");
+      setUser(null);
+    } else {
+      verifyToken(); //async function? how to deal with data?
+    }
+  }, []); //consider verifyToken() need to put dependency list[]?
+
+  const verifyToken = async () => {
+    try {
+      const user = await api.read_user();
+      setAuthStatus("authenticated");
+      setUser(user);
+    } catch (err) {
+      if (err.code === "TOKEN_EXPIRED" || err.code === "INVALID_CREDENTIALS") {
+        setAuthStatus("unauthenticated");
+        localStorage.removeItem("delivery_token");
+        setUser(null);
+      } else {
+        setError("Verification failed. Please check your connection and try again.");
+      }
+    }
+  };
 
   const cartItems = useMemo(() => {
     return Object.entries(cart)
       .map(([id, quantity]) => ({ ...foodCache[Number(id)], quantity }))
-      .filter((item) => item.id);
+      .filter((item) => item.id); //is possible to have filter situation?
   }, [cart, foodCache]);
 
   const cartCount = cartItems.reduce((sum, item) => sum + item.quantity, 0);
   const subtotal = cartItems.reduce((sum, item) => sum + item.quantity * item.price, 0);
 
   const openStore = async (store) => {
-    const detail = await api.store(store.id);
-    setFoodCache((current) => ({
-      ...current,
-      ...Object.fromEntries(detail.foods.map((food) => [food.id, food])),
-    })); //need a filter to avoid repeat?  no need
-    setActiveStore(detail);
-    setCheckout(null);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    try {
+      const detail = await api.store(store.id);
+      setFoodCache((current) => ({
+        ...current,
+        ...Object.fromEntries(detail.foods.map((food) => [food.id, food])),
+      })); //need a filter to avoid repeat?  no need
+      setActiveStore(detail);
+      setCheckout(null);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch(err) {
+      setError(err.message);  //找不到该接口，404；难道每个function都要写一个error状态吗？
+    }
+
   };
 
   const updateCart = (food, delta) => {
@@ -55,20 +90,34 @@ function App() {
 
   const handleAuth = ({ user: nextUser, token }) => {
     //localStorage.setItem("delivery_user", JSON.stringify(nextUser)); //it saved per login or update?
-    localStorage.setItem("delivery_token", token);
+    localStorage.setItem("delivery_token", token); //token shouldn't save here
     setUser(nextUser);
+    setAuthStatus("authenticated")
     setAuthOpen(false);
   };
 
   const placeOrder = async () => {
-    if (!user) {
+    if (authStatus === "unauthenticated") {
       setAuthOpen(true);
       return;
+    } else {
+      try {
+        const items = cartItems.map((item) => ({ food_id: item.id, quantity: item.quantity }));
+        const order = await api.createOrder(items);
+        setCheckout(order);
+        setCartOpen(false);
+      }
+      catch(err) {    //user validation or food unavailable issues? classification
+        setError(err.message)
+        if (err.code === "INVALID_CREDENTIALS" || err.code === "TOKEN_EXPIRED") {
+          setAuthStatus("unauthenticated")
+          setUser(null)
+          localStorage.removeItem("delivery_token")
+          setAuthOpen(true)
+          //need to return in cart? I think it can be returned in App
+        }
+      }
     }
-    const items = cartItems.map((item) => ({ food_id: item.id, quantity: item.quantity }));
-    const order = await api.createOrder(items);
-    setCheckout(order);
-    setCartOpen(false);
   };
 
   return (
@@ -111,20 +160,26 @@ function App() {
           onCheckout={placeOrder}
         />
       )}
+      // food unavailable, expire/credential, store-id 404,
+      {error && <span className="blocking-Notice">{error}</span>}
     </>
-  );
-}
+  )
+};
 
 function Home({ stores, onOpenStore }) {
   const [query,SetQuery] = useState('')
   const [response, SetResponse] = useState([])
   const [loading,SetLoading] = useState(false)
+  const [error, setError] = useState("")
+  //consider put them in App
   async function handleSearch(e){
     e.preventDefault()
     SetLoading(true)
     try{
       const result = await api.recommendations({user_input:query})
-      SetResponse(result) //how to handle error？
+      SetResponse(result) //how to handle error？need add catch error?
+    } catch (error) {
+      setError(error.message)
     }
     finally{
       SetLoading(false)
@@ -156,6 +211,7 @@ function Home({ stores, onOpenStore }) {
             />
             <button onClick={handleSearch} disabled={loading}>{loading ? "Loading...":"Search"}</button>
           </div>
+          {error && <span className="AI-error">{error}</span>}
         </div>
         <div className="recommendation-card">
           {response.map((store) => (
@@ -192,7 +248,7 @@ function Home({ stores, onOpenStore }) {
           </div>
           <button className="text-button">Sort by rating</button>
         </div>
-        <div className="store-grid">
+        {stores.length ? (<div className="store-grid">
           {stores.map((store) => (
             <button className="store-card" key={store.id} onClick={() => onOpenStore(store)}>
               <img src={store.hero_image} alt={store.name} />
@@ -205,12 +261,17 @@ function Home({ stores, onOpenStore }) {
             </button>
           ))}
         </div>
+        ):(
+            <div className="empty-stores"> /* new div */
+              <h3>Oh no! Here is empty.</h3>
+              <p>Try different locations to check.</p>
+            </div>
+        )}
       </section>
     </>
-  );
-}
+  )}
 
-function StoreDetail({ store, cart, onBack, onAdd }) {
+function StoreDetail({store, cart, onBack, onAdd}) {
   const categories = [...new Set(store.foods.map((food) => food.category))];
 
   return (
@@ -319,8 +380,9 @@ function AuthModal({ onClose, onAuth }) {
       const payload = mode === "login" ? { email: form.email, password: form.password } : form;
       const result = mode === "login" ? await api.login(payload) : await api.register(payload);
       onAuth(result); //it need create new Error for http exception
-    } catch (err) {
-      setError(err.message);
+    } catch (error) {
+      // code = "USER_EXISTS"  Please log in instead.
+      setError(error.message);
     }
   };
 
